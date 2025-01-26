@@ -1,0 +1,8 @@
+__pycache__
+*.pyc
+
+bin
+build
+temp
+
+__ignore*
