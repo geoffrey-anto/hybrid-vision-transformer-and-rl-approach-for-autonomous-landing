@@ -32,3 +32,15 @@ class Agent:
     
     def get_lidar_point_cloud(self):
         return self.client.getLidarData()
+    
+    def land_drone(self):
+        state = self.get_state()
+        current_state = state.landed_state
+        
+        if current_state == airsim.LandedState.Landed:
+            self.client.armDisarm(False)
+            return True
+        else:
+            self.client.landAsync().join()
+            self.client.armDisarm(False)
+            return True
