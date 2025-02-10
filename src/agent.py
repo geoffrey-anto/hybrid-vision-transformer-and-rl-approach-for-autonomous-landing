@@ -1,32 +1,34 @@
+import airsim
 from typing import NewType
+import config
 
 State = NewType("State", tuple)
 
 class Agent:
     def __init__(self, opts, *args, **kwargs):
-        # state = (x, y, z, vx, vy, vz, pitch, yaw, roll)
-        if kwargs.get("state"):
-            self.state = State(kwargs.get("state"))
-        else:
-            self.state = State((0, 0, 0, 0, 0, 0, 0, 0, 0))
         self.opts = opts
         self.gravity = opts.get("gravity")
         self.mass = opts.get("mass")
         
-    def move(self):
-        pass
+        self.client = airsim.MultirotorClient(ip=config.IP, port=config.PORT)
+        self.client.confirmConnection()
+        self.client.enableApiControl(True)
+        self.client.armDisarm(True)
+        
+    def start(self, initial_position):
+        self.client.takeoffAsync().join()
+        self.client.moveToPositionAsync(initial_position[0], initial_position[1], initial_position[2], config.VELOCITY).join()
+        return True
+        
+    def move(self, position):
+        self.client.moveToPositionAsync(position[0], position[1], position[2], config.VELOCITY).join()
+        return True
     
     def get_state(self):
-        return self.state
-
-    def act(self):
-        pass
-
-    def learn(self):
-        pass
-
-    def save(self):
-        pass
-
-    def load(self):
-        pass
+        return self.client.getMultirotorState()
+    
+    def get_image(self):
+        return self.client.simGetImage("0", airsim.ImageType.Scene)
+    
+    def get_lidar_point_cloud(self):
+        return self.client.getLidarData()
