@@ -1,0 +1,2 @@
+GRAVITY = 9.81
+MASS = 2.5
