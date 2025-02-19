@@ -8,3 +8,8 @@ temp
 __ignore*
 
 env
+
+dataset/*
+!/dataset/generate.py
+
+*.pth
