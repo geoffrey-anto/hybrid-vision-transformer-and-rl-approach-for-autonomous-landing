@@ -1,706 +1,1134 @@
+"""
+Drone Landing Reinforcement Learning Project
+
+This project trains a drone to land on even terrain using:
+- PPO (Proximal Policy Optimization) algorithm
+- Vision transformer for image processing
+- LiDAR data integration
+- Multi-core training capabilities
+"""
+
 import os
 import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.distributions import Categorical
+import matplotlib.pyplot as plt
+import logging
 import gym
 from gym import spaces
-import airsim
-import cv2
-from PIL import Image
-from transformers import ViTModel, ViTConfig
 import random
+from concurrent.futures import ProcessPoolExecutor
 from collections import deque
 
-# Set seeds for reproducibility
-torch.manual_seed(42)
-np.random.seed(42)
-random.seed(42)
 
-# Configuration parameters
-CONFIG = {
-    "image_size": 224,  # Input image size for ViT
-    "patch_size": 16,   # ViT patch size
-    "lidar_points": 256,  # Number of LiDAR points to use
-    "hidden_dim": 128,    # Hidden dimension for policy networks
-    "learning_rate": 3e-4,
-    "gamma": 0.99,        # Discount factor
-    "gae_lambda": 0.95,   # GAE lambda parameter
-    "clip_param": 0.2,    # PPO clip parameter
-    "value_loss_coef": 0.5,
-    "entropy_coef": 0.01,
-    "max_grad_norm": 0.5,
-    "ppo_epochs": 10,     # Number of PPO updates per batch
-    "batch_size": 64,
-    "buffer_size": 2048,  # Experience buffer size
-    "total_timesteps": 1000000,
-    "checkpoint_interval": 10000,  # Save model every n steps
-    "eval_interval": 5000,  # Evaluate model every n steps
-    "checkpoint_dir": "./checkpoints",
-    "model_name": "drone_landing_model",
-    "lidar_sensor_name": "LidarSensor1"  # Name of the LiDAR sensor in AirSim
-}
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("drone_landing.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("drone_landing")
 
-# Create checkpoint directory
-os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {device}")
 
-class ViTDronePolicy(nn.Module):
-    """Vision Transformer-based policy network for drone landing"""
-    
-    def __init__(self, image_size=224, patch_size=16, lidar_points=256, hidden_dim=128, action_dim=4):
-        super(ViTDronePolicy, self).__init__()
+# Define the Drone Environment
+class DroneEnvironment(gym.Env):
+    def __init__(self, terrain_size=100, starting_height=10, render_mode=None):
+        super(DroneEnvironment, self).__init__()
         
-        # ViT configuration for camera image processing
-        vit_config = ViTConfig(
-            image_size=image_size,
-            patch_size=patch_size,
-            hidden_size=hidden_dim,
-            num_hidden_layers=4,
-            num_attention_heads=4,
-            intermediate_size=hidden_dim*4,
-            hidden_dropout_prob=0.1,
-            attention_probs_dropout_prob=0.1,
-        )
+        # Environment parameters
+        self.terrain_size = terrain_size
+        self.starting_height = starting_height
+        self.max_steps = 100
+        self.current_step = 0
+        self.render_mode = render_mode
         
-        # ViT model for visual features
-        self.vit = ViTModel(vit_config)
+        # Action space: 0 = left, 1 = right, 2 = down
+        self.action_space = spaces.Discrete(3)
         
-        # LiDAR processing network
-        self.lidar_encoder = nn.Sequential(
-            nn.Linear(lidar_points * 3, hidden_dim * 2),  # Each point has x,y,z
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU()
-        )
+        # Observation space: camera (RGB) and LiDAR data
+        self.camera_shape = (3, 64, 64)  # RGB image
+        self.lidar_shape = (16,)  # 16 LiDAR readings
         
-        # Combined feature processing
-        self.combined_layer = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU()
-        )
-        
-        # Policy head (actor)
-        self.actor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim)
-        )
-        
-        # Value head (critic)
-        self.critic = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
-    
-    def forward(self, image, lidar):
-        # Process image with ViT
-        vit_output = self.vit(pixel_values=image).last_hidden_state[:, 0]  # Use CLS token
-        
-        # Process LiDAR data
-        lidar_flat = lidar.reshape(lidar.shape[0], -1)  # Flatten points
-        lidar_features = self.lidar_encoder(lidar_flat)
-        
-        # Combine features
-        combined_features = torch.cat([vit_output, lidar_features], dim=1)
-        features = self.combined_layer(combined_features)
-        
-        # Actor and critic outputs
-        action_logits = self.actor(features)
-        value = self.critic(features)
-        
-        return action_logits, value
-    
-    def act(self, image, lidar):
-        with torch.no_grad():
-            action_logits, value = self.forward(image, lidar)
-            action_probs = torch.softmax(action_logits, dim=-1)
-            dist = Categorical(action_probs)
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
-            
-        return action.item(), log_prob.item(), value.item()
-    
-    def evaluate(self, image, lidar, action):
-        action_logits, value = self.forward(image, lidar)
-        action_probs = torch.softmax(action_logits, dim=-1)
-        dist = Categorical(action_probs)
-        
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
-        
-        return log_prob, entropy, value
-
-class AirSimDroneLandingEnv:
-    """Custom environment for drone landing in AirSim"""
-    
-    def __init__(self):
-        # Connect to AirSim simulator
-        self.client = airsim.MultirotorClient()
-        self.client.confirmConnection()
-        
-        # Set up the LiDAR sensor
-        self.setup_lidar_sensor()
-        
-        # Action and observation spaces
-        # Actions: Move Forward, Backward, Left, Right
-        self.action_space = spaces.Discrete(4)
-        
-        # Observation space: Camera image and LiDAR points
         self.observation_space = spaces.Dict({
-            'camera': spaces.Box(low=0, high=255, shape=(3, CONFIG["image_size"], CONFIG["image_size"]), dtype=np.uint8),
-            'lidar': spaces.Box(low=-100, high=100, shape=(CONFIG["lidar_points"], 3), dtype=np.float32)
+            'camera': spaces.Box(low=0, high=255, shape=self.camera_shape, dtype=np.uint8),
+            'lidar': spaces.Box(low=0, high=100, shape=self.lidar_shape, dtype=np.float32)
         })
         
-        # Episode tracking
-        self.episode_steps = 0
-        self.max_episode_steps = 500
+        # Initialize terrain, drone position, and history
+        self.reset()
         
-    def setup_lidar_sensor(self):
-        """Set up the LiDAR sensor in AirSim"""
-        try:
-            # Check if the LiDAR sensor is already set up
-            self.client.getLidarData(lidar_name="LidarSensor2", vehicle_name="")
-            print(f"LiDAR sensor '{CONFIG['lidar_sensor_name']}' already exists.")
-        except:
-            print(f"Setting up LiDAR sensor '{CONFIG['lidar_sensor_name']}'...")
-            # If using settings.json approach, just print instructions
-            print("Please ensure your AirSim settings.json includes a LiDAR sensor configuration:")
-            print("""
-            "Sensors": {
-                "LidarSensor1": {
-                    "SensorType": 6,
-                    "Enabled": true,
-                    "NumberOfChannels": 16,
-                    "RotationsPerSecond": 10,
-                    "PointsPerSecond": 10000,
-                    "X": 0, "Y": 0, "Z": -1,
-                    "Roll": 0, "Pitch": 0, "Yaw": 0,
-                    "VerticalFOVUpper": 10,
-                    "VerticalFOVLower": -10,
-                    "HorizontalFOVStart": -45,
-                    "HorizontalFOVEnd": 45,
-                    "DrawDebugPoints": true,
-                    "DataFrame": "SensorLocalFrame"
-                }
-            }
-            """)
+        # For visualization
+        self.trajectory = []
+
+    def generate_terrain(self):
+        """Generate a terrain with even and uneven parts."""
+        # Base terrain
+        terrain = np.zeros(self.terrain_size)
+        
+        # Add some uneven areas (represented by higher values)
+        for _ in range(5):
+            start = random.randint(0, self.terrain_size - 20)
+            length = random.randint(5, 15)
+            height = random.uniform(0.5, 2.0)
+            terrain[start:start+length] = height
+        
+        # Smooth the terrain
+        terrain = np.convolve(terrain, np.ones(5)/5, mode='same')
+        
+        return terrain
+
+    def is_even_terrain(self, position):
+        """Check if the current position is on even terrain."""
+        # Check current position and a small window around it
+        left_idx = max(0, int(position) - 2)
+        right_idx = min(self.terrain_size - 1, int(position) + 2)
+        
+        # Calculate the variance of the terrain height in this region
+        region = self.terrain[left_idx:right_idx+1]
+        variance = np.var(region)
+        
+        # Low variance means even terrain
+        return variance < 0.05
     
-    def reset(self):
-        """Reset the environment at the beginning of an episode"""
-        self.client.reset()
-        self.client.enableApiControl(True)
-        self.client.armDisarm(True)
+    def get_observation(self):
+        """Get camera and LiDAR observations."""
+        # Generate camera view
+        camera_obs = np.zeros(self.camera_shape, dtype=np.uint8)
         
-        # Take off and hover at starting position (about 20m above ground)
-        self.client.takeoffAsync().join()
+        # Add terrain features to the bottom of the image
+        terrain_slice = self.terrain[max(0, int(self.drone_x) - 32):min(self.terrain_size, int(self.drone_x) + 32)]
+        if len(terrain_slice) < 64:
+            padding = 64 - len(terrain_slice)
+            terrain_slice = np.pad(terrain_slice, (0, padding), 'constant')
         
-        # Random starting position within a reasonable area
-        x = np.random.uniform(-40, 40)
-        y = np.random.uniform(-40, 40)
-        print(x, y)
-        z = -30  # 20m above ground (negative z is up in AirSim)
+        # Normalize terrain to image height
+        max_height = 20
+        normalized_terrain = (terrain_slice / max_height * 30).astype(int)
         
-        # Move to starting position
-        self.client.moveToPositionAsync(x, y, z, 5).join()
-        self.client.hoverAsync().join()
+        # Add terrain to image
+        for i in range(64):
+            h = int(normalized_terrain[i])
+            camera_obs[0, 63-h:64, i] = 100  # Red channel
+            camera_obs[1, 63-h:64, i] = 100  # Green channel
+            
+        # Add drone to the image
+        drone_y_pixel = int(63 - (self.drone_y / max_height * 30))
+        drone_x_pixel = 32  # Center of the image
         
-        # Wait a moment for sensors to stabilize
-        time.sleep(1)
+        # Draw drone as a blue dot
+        for c in range(-2, 3):
+            for r in range(-2, 3):
+                if 0 <= drone_y_pixel + r < 64 and 0 <= drone_x_pixel + c < 64:
+                    camera_obs[2, drone_y_pixel + r, drone_x_pixel + c] = 255  # Blue channel
         
-        # Reset episode steps
-        self.episode_steps = 0
+        # Generate LiDAR readings
+        lidar_obs = np.zeros(self.lidar_shape, dtype=np.float32)
+        for i in range(16):
+            # Position relative to drone
+            rel_x = int(self.drone_x) - 8 + i
+            if 0 <= rel_x < self.terrain_size:
+                # Distance to ground
+                lidar_obs[i] = self.drone_y - self.terrain[rel_x]
+            else:
+                lidar_obs[i] = self.drone_y  # Out of bounds, return height above ground level
+        
+        return {
+            'camera': camera_obs,
+            'lidar': lidar_obs
+        }
+    
+    def reset(self, seed=None):
+        """Reset the environment for a new episode."""
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+            
+        # Generate terrain
+        self.terrain = self.generate_terrain()
+        
+        # Place drone at random x position and fixed starting height
+        self.drone_x = random.uniform(0, self.terrain_size - 1)
+        self.drone_y = self.starting_height
+        
+        # Reset step counter
+        self.current_step = 0
+        
+        # Reset trajectory
+        self.trajectory = [(self.drone_x, self.drone_y)]
         
         # Get initial observation
-        return self._get_observation()
+        observation = self.get_observation()
+        
+        # Return observation and info
+        info = {}
+        
+        return observation, info
     
     def step(self, action):
-        """Execute action and return new state, reward, done, info"""
-        self.episode_steps += 1
+        """Take an action in the environment."""
+        self.current_step += 1
         
-        # Convert action to drone movement
+        # Move drone based on action
         if action == 0:  # Left
-            self.client.moveByVelocityAsync(0, -1, 0, 0.5).join()
+            self.drone_x = max(0, self.drone_x - 1.0)
         elif action == 1:  # Right
-            self.client.moveByVelocityAsync(0, 1, 0, 0.5).join()
+            self.drone_x = min(self.terrain_size - 1, self.drone_x + 1.0)
         elif action == 2:  # Down
-            self.client.moveByVelocityAsync(0, 0, 1, 0.5).join()
-        elif action == 3:  # Forward
-            self.client.moveByVelocityAsync(1, 0, 0, 0.5).join()
+            self.drone_y = max(0, self.drone_y - 0.5)
+            
+        # Update trajectory
+        self.trajectory.append((self.drone_x, self.drone_y))
         
-        # Wait a bit for the action to take effect
-        time.sleep(0.1)
+        # Get height of terrain at current position
+        terrain_height = self.terrain[int(self.drone_x)]
         
-        # Get drone state
-        drone_state = self.client.getMultirotorState()
-        position = drone_state.kinematics_estimated.position
-
-        if self.episode_steps % 10 == 0:
-            print(f"Step {self.episode_steps}: Position: ({position.x_val}, {position.y_val}, {position.z_val})")
+        # Check if landed (drone height <= terrain height)
+        landed = self.drone_y <= terrain_height
         
-        # Calculate distance to ground
-        ground_z = 0  # Assuming ground is at z=0
-        height_above_ground = abs(position.z_val)
+        # Check if landing is on even terrain
+        on_even_terrain = self.is_even_terrain(self.drone_x)
         
-        # Check for landing or collision
-        collision_info = self.client.simGetCollisionInfo()
-        landed = height_above_ground < 0.5 and abs(drone_state.kinematics_estimated.linear_velocity.z_val) < 0.1
-        crashed = collision_info.has_collided and not landed
+        # Default reward: small penalty for fuel consumption
+        reward = -0.01
         
-        # Determine if episode is done
-        done = landed or crashed or self.episode_steps >= self.max_episode_steps
-        
-        # Calculate reward
-        reward = self._compute_reward(height_above_ground, landed, crashed)
-        
-        # Get observation
-        obs = self._get_observation()
-        
-        # Info dictionary
+        done = False
         info = {
-            'height': height_above_ground,
-            'landed': landed,
-            'crashed': crashed,
-            'position': (position.x_val, position.y_val, position.z_val)
+            "landed": False,
+            "landing_success": False
         }
-        
-        return obs, reward, done, info
-    
-    def _compute_reward(self, height, landed, crashed):
-        """Compute reward based on drone state"""
-        if crashed:
-            return -100  # Large penalty for crashing
         
         if landed:
-            return 100  # Large reward for successful landing
-        
-        # Encourage descending, but not too fast
-        drone_state = self.client.getMultirotorState()
-        velocity_z = drone_state.kinematics_estimated.linear_velocity.z_val
-        
-        # Small reward for getting closer to the ground
-        height_reward = -0.2 * height
-        
-        # Penalty for high velocity when close to ground
-        velocity_penalty = 0
-        if height < 5 and velocity_z > 1:
-            velocity_penalty = -0.5 * (velocity_z - 1)**2
-        
-        # Encourage the drone to stay level
-        orientation = drone_state.kinematics_estimated.orientation
-        pitch, roll = airsim.to_eularian_angles(orientation)[0:2]
-        orientation_penalty = -0.1 * (abs(pitch) + abs(roll))
-        
-        return height_reward + velocity_penalty + orientation_penalty
-    
-    def _get_observation(self):
-        """Get observation from AirSim"""
-        # Get camera image
-        responses = self.client.simGetImages([
-            airsim.ImageRequest("bottom_center", airsim.ImageType.Scene, False, False)
-        ])
-        
-        # Process image
-        img_rgba = np.frombuffer(responses[0].image_data_uint8, dtype=np.uint8)
-        img_rgba = img_rgba.reshape(responses[0].height, responses[0].width, 3)
-        img_rgb = cv2.cvtColor(img_rgba, cv2.COLOR_BGR2RGB)
-        
-        # Resize image to match ViT input size
-        img = cv2.resize(img_rgb, (CONFIG["image_size"], CONFIG["image_size"]))
-        img = np.transpose(img, (2, 0, 1))  # Convert to channel-first format
-        
-        # Get LiDAR data with error handling
-        try:
-            lidar_data = self.client.getLidarData(lidar_name="LidarSensor2")
+            done = True
+            info["landed"] = True
             
-            if lidar_data and len(lidar_data.point_cloud) >= 3:
-                # Process valid LiDAR data
-                points = np.array(lidar_data.point_cloud, dtype=np.float32).reshape(-1, 3)
+            if on_even_terrain:
+                # Good landing on even terrain
+                reward = 10.0
+                info["landing_success"] = True
+                logger.info(f"Successful landing at position {self.drone_x:.2f} with height {terrain_height:.2f}")
             else:
-                # Handle empty LiDAR data
-                # print("Warning: Empty LiDAR data received, using simulated data")
-                # Generate fake points around the drone as a fallback
-                drone_pos = self.client.getMultirotorState().kinematics_estimated.position
-                points = self._generate_simulated_lidar_points(drone_pos)
-        except Exception as e:
-            print(f"Error getting LiDAR data: {e}")
-            print("Using simulated LiDAR data instead")
-            # Generate synthetic LiDAR points as fallback
-            drone_pos = self.client.getMultirotorState().kinematics_estimated.position
-            points = self._generate_simulated_lidar_points(drone_pos)
-        
-        # If we have too few points, pad with zeros
-        if len(points) < CONFIG["lidar_points"]:
-            padding = np.zeros((CONFIG["lidar_points"] - len(points), 3), dtype=np.float32)
-            points = np.vstack([points, padding])
-        # If we have too many points, sample randomly
-        elif len(points) > CONFIG["lidar_points"]:
-            indices = np.random.choice(len(points), CONFIG["lidar_points"], replace=False)
-            points = points[indices]
+                # Bad landing on uneven terrain
+                reward = -5.0
+                logger.info(f"Failed landing at position {self.drone_x:.2f} with height {terrain_height:.2f} (uneven terrain)")
+        elif self.current_step >= self.max_steps:
+            # Out of time/fuel
+            done = True
+            reward = -1.0
+            logger.info("Episode timed out without landing")
             
-        return {
-            'camera': img.astype(np.float32) / 255.0,  # Normalize to [0,1]
-            'lidar': points
-        }
+        # Get new observation
+        observation = self.get_observation()
+        
+        return observation, reward, done, False, info  # False is for truncated in gym step API
     
-    def _generate_simulated_lidar_points(self, drone_pos, num_points=100):
-        """Generate synthetic LiDAR points for testing when real data isn't available"""
-        # Get drone position
-        x, y, z = drone_pos.x_val, drone_pos.y_val, drone_pos.z_val
-        
-        # Generate points in a cone shape pointing downward
-        points = []
-        for _ in range(num_points):
-            # Random angle in 360 degrees
-            angle = np.random.uniform(0, 2 * np.pi)
-            # Random distance from center, increasing with radius (cone shape)
-            dist_factor = np.random.uniform(0, 1) ** 0.5  # Square root for more even distribution
-            dist_h = dist_factor * abs(z) * 0.5  # Horizontal distance proportional to height
+    def render(self):
+        """Render the environment."""
+        if self.render_mode == "human":
+            plt.figure(figsize=(10, 6))
             
-            # Calculate point coordinates (cone pointing down from drone)
-            px = x + dist_h * np.cos(angle)
-            py = y + dist_h * np.sin(angle)
-            pz = np.random.uniform(z, 0)  # Between drone height and ground
+            # Plot terrain
+            x = np.arange(self.terrain_size)
+            plt.plot(x, self.terrain, 'g-')
             
-            points.append([px, py, pz])
-        
-        return np.array(points, dtype=np.float32)
+            # Plot drone trajectory
+            traj_x, traj_y = zip(*self.trajectory)
+            plt.plot(traj_x, traj_y, 'b-')
+            
+            # Plot current drone position
+            plt.plot(self.drone_x, self.drone_y, 'ro')
+            
+            plt.title("Drone Landing Simulation")
+            plt.xlabel("Position")
+            plt.ylabel("Height")
+            plt.ylim(0, self.starting_height + 1)
+            
+            plt.draw()
+            plt.pause(0.001)
+            plt.close()
 
-class Buffer:
-    """PPO experience buffer"""
-    
-    def __init__(self, buffer_size, image_size, lidar_points):
-        self.camera_imgs = np.zeros((buffer_size, 3, image_size, image_size), dtype=np.float32)
-        self.lidar_data = np.zeros((buffer_size, lidar_points, 3), dtype=np.float32)
-        self.actions = np.zeros(buffer_size, dtype=np.int64)
-        self.rewards = np.zeros(buffer_size, dtype=np.float32)
-        self.values = np.zeros(buffer_size, dtype=np.float32)
-        self.log_probs = np.zeros(buffer_size, dtype=np.float32)
-        self.dones = np.zeros(buffer_size, dtype=np.bool_)
+# Neural Network Models
+class VisionTransformer(nn.Module):
+    def __init__(self, img_size=64, patch_size=8, in_channels=3, embedding_dim=128, num_heads=4, num_layers=4):
+        super(VisionTransformer, self).__init__()
         
-        self.size = 0
-        self.buffer_size = buffer_size
+        # Calculate number of patches
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
         
-    def add(self, camera_img, lidar_data, action, reward, value, log_prob, done):
-        idx = self.size % self.buffer_size
-        
-        self.camera_imgs[idx] = camera_img
-        self.lidar_data[idx] = lidar_data
-        self.actions[idx] = action
-        self.rewards[idx] = reward
-        self.values[idx] = value
-        self.log_probs[idx] = log_prob
-        self.dones[idx] = done
-        
-        self.size += 1
-        
-    def get(self):
-        indices = np.arange(self.buffer_size)
-        return (
-            torch.FloatTensor(self.camera_imgs),
-            torch.FloatTensor(self.lidar_data),
-            torch.LongTensor(self.actions),
-            torch.FloatTensor(self.rewards),
-            torch.FloatTensor(self.values),
-            torch.FloatTensor(self.log_probs),
-            torch.BoolTensor(self.dones),
-            indices
+        # Patch embedding
+        self.patch_embedding = nn.Conv2d(
+            in_channels, embedding_dim, 
+            kernel_size=patch_size, stride=patch_size
         )
         
-    def clear(self):
-        self.size = 0
-
-def compute_gae(rewards, values, dones, gamma, lam):
-    """Compute Generalized Advantage Estimation"""
-    gae = 0
-    returns = np.zeros_like(values)
-    
-    for t in reversed(range(len(rewards))):
-        if t < len(rewards) - 1:
-            next_non_terminal = 1.0 - dones[t]
-            next_values = values[t + 1]
-        else:
-            next_non_terminal = 1.0 - dones[t]
-            next_values = 0
-            
-        delta = rewards[t] + gamma * next_values * next_non_terminal - values[t]
-        gae = delta + gamma * lam * next_non_terminal * gae
-        returns[t] = gae + values[t]
+        # Position embedding
+        self.pos_embedding = nn.Parameter(torch.zeros(1, self.num_patches + 1, embedding_dim))
         
-    return returns
+        # Class token
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=num_heads,
+            dim_feedforward=embedding_dim * 4,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Output MLP
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(embedding_dim),
+            nn.Linear(embedding_dim, embedding_dim)
+        )
+        
+    def forward(self, x):
+        # x shape: [batch_size, channels, height, width]
+        batch_size = x.shape[0]
+        
+        # Create patch embeddings
+        x = self.patch_embedding(x)  # [batch_size, embedding_dim, height/patch_size, width/patch_size]
+        x = x.flatten(2).transpose(1, 2)  # [batch_size, num_patches, embedding_dim]
+        
+        # Add class token
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        
+        # Add position embedding
+        x = x + self.pos_embedding[:, :(x.size(1))]
+        
+        # Apply transformer
+        x = self.transformer(x)
+        
+        # Take class token for output
+        x = x[:, 0]
+        
+        # Apply MLP
+        x = self.mlp_head(x)
+        
+        return x
 
-def train():
-    """Main training function"""
-    # Create environment and policy
-    env = AirSimDroneLandingEnv()
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    policy = ViTDronePolicy(
-        image_size=CONFIG["image_size"],
-        patch_size=CONFIG["patch_size"],
-        lidar_points=CONFIG["lidar_points"],
-        hidden_dim=CONFIG["hidden_dim"],
-        action_dim=env.action_space.n
-    ).to(device)
-    
-    optimizer = optim.Adam(policy.parameters(), lr=CONFIG["learning_rate"])
-    
-    # Experience buffer
-    buffer = Buffer(
-        CONFIG["buffer_size"],
-        CONFIG["image_size"],
-        CONFIG["lidar_points"]
-    )
-    
-    # Tracking variables
-    global_step = 0
-    episode_rewards = []
-    
-    print("Starting training...")
-    
-    try:
-        while global_step < CONFIG["total_timesteps"]:
-            obs = env.reset()
-            episode_reward = 0
-            done = False
+class LidarProcessor(nn.Module):
+    def __init__(self, input_dim=16, hidden_dim=64, output_dim=128):
+        super(LidarProcessor, self).__init__()
+        
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+        
+    def forward(self, x):
+        return self.network(x)
+
+class ResNet50Processor(nn.Module):
+    def __init__(self, output_dim=128):
+        super(ResNet50Processor, self).__init__()
+        
+        # We're implementing a simplified version for this example
+        # In a real implementation, you would use torchvision.models.resnet50
+        
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=7, stride=2, padding=3)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.relu = nn.ReLU()
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
+        # Simplified ResNet blocks
+        self.layer1 = self._make_layer(16, 32, 2)
+        self.layer2 = self._make_layer(32, 64, 2)
+        
+        # Global average pooling and final layer
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(64, output_dim)
+        
+    def _make_layer(self, in_channels, out_channels, blocks):
+        layers = []
+        # First block handles downsampling
+        layers.append(nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU()
+        ))
+        
+        # Additional blocks
+        for _ in range(1, blocks):
+            layers.append(nn.Sequential(
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU()
+            ))
             
-            while not done and global_step < CONFIG["total_timesteps"]:
-                # Convert observations to tensors
-                camera_img = torch.FloatTensor(np.expand_dims(obs['camera'], 0)).to(device)
-                lidar_data = torch.FloatTensor(np.expand_dims(obs['lidar'], 0)).to(device)
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        
+        x = self.layer1(x)
+        x = self.layer2(x)
+        
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        
+        return x
+
+class SimpleCNN(nn.Module):
+    def __init__(self, output_dim=128):
+        super(SimpleCNN, self).__init__()
+        
+        self.network = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(64, output_dim)
+        )
+        
+    def forward(self, x):
+        return self.network(x)
+
+class FeatureExtractor(nn.Module):
+    def __init__(self, model_type="vit", fusion_dim=256):
+        super(FeatureExtractor, self).__init__()
+        
+        # Initialize model based on type
+        if model_type == "vit":
+            self.image_processor = VisionTransformer(
+                img_size=64, 
+                patch_size=8, 
+                in_channels=3, 
+                embedding_dim=128
+            )
+        elif model_type == "resnet50":
+            self.image_processor = ResNet50Processor(output_dim=128)
+        elif model_type == "cnn":
+            self.image_processor = SimpleCNN(output_dim=128)
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
+            
+        self.lidar_processor = LidarProcessor(input_dim=16, output_dim=128)
+        
+        # Fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(256, fusion_dim),
+            nn.ReLU(),
+            nn.Linear(fusion_dim, fusion_dim)
+        )
+        
+        self.model_type = model_type
+        
+    def forward(self, observation):
+        # Process image from camera
+        camera_data = observation['camera'].float() / 255.0  # Normalize to [0, 1]
+        image_features = self.image_processor(camera_data)
+        
+        # Process LiDAR data
+        lidar_data = observation['lidar']
+        lidar_features = self.lidar_processor(lidar_data)
+        
+        # Concatenate features
+        combined_features = torch.cat([image_features, lidar_features], dim=1)
+        
+        # Fuse features
+        fused_features = self.fusion(combined_features)
+        
+        return fused_features
+
+class PolicyNetwork(nn.Module):
+    def __init__(self, feature_dim=256, num_actions=3):
+        super(PolicyNetwork, self).__init__()
+        
+        self.network = nn.Sequential(
+            nn.Linear(feature_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_actions)
+        )
+        
+    def forward(self, x):
+        action_logits = self.network(x)
+        return action_logits
+
+class ValueNetwork(nn.Module):
+    def __init__(self, feature_dim=256):
+        super(ValueNetwork, self).__init__()
+        
+        self.network = nn.Sequential(
+            nn.Linear(feature_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        
+    def forward(self, x):
+        return self.network(x)
+
+class PPOAgent:
+    def __init__(self, 
+                 model_type="vit",
+                 gamma=0.99, 
+                 gae_lambda=0.95,
+                 clip_param=0.2,
+                 value_loss_coef=0.5,
+                 entropy_coef=0.01,
+                 max_grad_norm=0.5,
+                 lr=3e-4,
+                 batch_size=64,
+                 ppo_epochs=10,
+                 device=device):
+        
+        self.model_type = model_type
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.clip_param = clip_param
+        self.value_loss_coef = value_loss_coef
+        self.entropy_coef = entropy_coef
+        self.max_grad_norm = max_grad_norm
+        self.batch_size = batch_size
+        self.ppo_epochs = ppo_epochs
+        self.device = device
+        
+        # Initialize networks
+        self.feature_extractor = FeatureExtractor(model_type=model_type).to(device)
+        self.policy = PolicyNetwork().to(device)
+        self.value = ValueNetwork().to(device)
+        
+        # Setup optimizers
+        self.optimizer = optim.Adam([
+            {'params': self.feature_extractor.parameters()},
+            {'params': self.policy.parameters()},
+            {'params': self.value.parameters()}
+        ], lr=lr)
+        
+        # For saving and loading
+        self.best_reward = float('-inf')
+        
+    def get_action(self, observation, evaluate=False):
+        # Convert observation to tensors
+        camera = torch.FloatTensor(observation['camera']).unsqueeze(0).to(self.device) / 255.0
+        lidar = torch.FloatTensor(observation['lidar']).unsqueeze(0).to(self.device)
+        
+        processed_observation = {
+            'camera': camera,
+            'lidar': lidar
+        }
+        
+        # Get features
+        with torch.no_grad():
+            features = self.feature_extractor(processed_observation)
+            action_logits = self.policy(features)
+            value = self.value(features)
+        
+        # Get action distribution
+        action_probs = F.softmax(action_logits, dim=-1)
+        dist = Categorical(action_probs)
+        
+        # Sample action or get most likely action
+        if evaluate:
+            action = action_probs.argmax(dim=-1)
+        else:
+            action = dist.sample()
+        
+        # Get log probability
+        log_prob = dist.log_prob(action)
+        
+        return action.item(), log_prob.item(), value.item()
+    
+    def compute_gae(self, rewards, values, dones):
+        """Compute Generalized Advantage Estimation."""
+        advantages = []
+        gae = 0
+        
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                next_value = 0
+            else:
+                next_value = values[t + 1]
                 
-                # Get action from policy
-                action, log_prob, value = policy.act(camera_img, lidar_data)
+            delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - values[t]
+            gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
+            advantages.insert(0, gae)
+            
+        return advantages
+    
+    def update(self, rollouts):
+        """Update policy and value networks using PPO algorithm."""
+        # Prepare data
+        observations = rollouts['observations']
+        actions = torch.LongTensor(rollouts['actions']).to(self.device)
+        old_log_probs = torch.FloatTensor(rollouts['log_probs']).to(self.device)
+        rewards = rollouts['rewards']
+        dones = rollouts['dones']
+        values = rollouts['values']
+        
+        # Compute returns and advantages
+        advantages = self.compute_gae(rewards, values, dones)
+        advantages = torch.FloatTensor(advantages).to(self.device)
+        
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # Compute returns (value targets)
+        returns = advantages + torch.FloatTensor(values).to(self.device)
+        
+        # Prepare minibatches
+        batch_size = min(self.batch_size, len(observations))
+        indices = np.arange(len(observations))
+        
+        # PPO update loop
+        total_policy_loss = 0
+        total_value_loss = 0
+        total_entropy = 0
+        
+        for _ in range(self.ppo_epochs):
+            np.random.shuffle(indices)
+            
+            for start_idx in range(0, len(observations), batch_size):
+                end_idx = min(start_idx + batch_size, len(observations))
+                batch_indices = indices[start_idx:end_idx]
                 
-                # Step environment
-                next_obs, reward, done, info = env.step(action)
+                # Process batch observations
+                batch_camera = torch.FloatTensor(
+                    np.stack([observations[i]['camera'] for i in batch_indices])
+                ).to(self.device) / 255.0
                 
-                # Store transition in buffer
-                buffer.add(
-                    obs['camera'],
-                    obs['lidar'],
-                    action,
-                    reward,
-                    value,
-                    log_prob,
-                    done
+                batch_lidar = torch.FloatTensor(
+                    np.stack([observations[i]['lidar'] for i in batch_indices])
+                ).to(self.device)
+                
+                batch_observations = {
+                    'camera': batch_camera,
+                    'lidar': batch_lidar
+                }
+                
+                # Get new features, action logits, and values
+                features = self.feature_extractor(batch_observations)
+                action_logits = self.policy(features)
+                current_values = self.value(features).squeeze(-1)
+                
+                # Get action distribution
+                action_probs = F.softmax(action_logits, dim=-1)
+                dist = Categorical(action_probs)
+                
+                # Get batch items
+                batch_actions = actions[batch_indices]
+                batch_old_log_probs = old_log_probs[batch_indices]
+                batch_advantages = advantages[batch_indices]
+                batch_returns = returns[batch_indices]
+                
+                # Compute new log probs and entropy
+                new_log_probs = dist.log_prob(batch_actions)
+                entropy = dist.entropy().mean()
+                
+                # Compute policy loss (PPO clipped objective)
+                ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                surr1 = ratio * batch_advantages
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * batch_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # Compute value loss
+                value_loss = F.mse_loss(current_values, batch_returns)
+                
+                # Compute total loss
+                loss = policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
+                
+                # Update networks
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.feature_extractor.parameters()) + 
+                    list(self.policy.parameters()) + 
+                    list(self.value.parameters()),
+                    self.max_grad_norm
                 )
+                self.optimizer.step()
                 
-                obs = next_obs
-                episode_reward += reward
-                global_step += 1
-                
-                # Check if buffer is full and update policy
-                if buffer.size == CONFIG["buffer_size"]:
-                    # Get data from buffer
-                    camera_imgs, lidar_data, actions, rewards, values, old_log_probs, dones, indices = buffer.get()
-                    
-                    # Compute returns using GAE
-                    returns = compute_gae(
-                        rewards.numpy(), 
-                        values.numpy(), 
-                        dones.numpy(), 
-                        CONFIG["gamma"], 
-                        CONFIG["gae_lambda"]
-                    )
-                    returns = torch.FloatTensor(returns)
-                    
-                    # PPO update
-                    for _ in range(CONFIG["ppo_epochs"]):
-                        # Generate random mini-batches
-                        batch_size = CONFIG["batch_size"]
-                        batch_indices = np.random.choice(
-                            CONFIG["buffer_size"], 
-                            batch_size, 
-                            replace=False
-                        )
-                        
-                        # Get batch data
-                        batch_camera_imgs = camera_imgs[batch_indices].to(device)
-                        batch_lidar_data = lidar_data[batch_indices].to(device)
-                        batch_actions = actions[batch_indices].to(device)
-                        batch_returns = returns[batch_indices].to(device)
-                        batch_old_log_probs = old_log_probs[batch_indices].to(device)
-                        
-                        # Forward pass
-                        new_log_probs, entropy, new_values = policy.evaluate(
-                            batch_camera_imgs,
-                            batch_lidar_data,
-                            batch_actions
-                        )
-                        
-                        # Calculate ratio and surrogate loss
-                        ratio = torch.exp(new_log_probs - batch_old_log_probs)
-                        advantages = batch_returns - new_values.squeeze(-1)
-                        
-                        # Normalize advantages
-                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                        
-                        # PPO policy loss
-                        surr1 = ratio * advantages
-                        surr2 = torch.clamp(ratio, 1.0 - CONFIG["clip_param"], 1.0 + CONFIG["clip_param"]) * advantages
-                        policy_loss = -torch.min(surr1, surr2).mean()
-                        
-                        # Value loss
-                        value_loss = CONFIG["value_loss_coef"] * torch.nn.functional.mse_loss(new_values.squeeze(-1), batch_returns)
-                        
-                        # Entropy bonus
-                        entropy_loss = -CONFIG["entropy_coef"] * entropy.mean()
-                        
-                        # Total loss
-                        loss = policy_loss + value_loss + entropy_loss
-                        
-                        # Update policy
-                        optimizer.zero_grad()
-                        loss.backward()
-                        nn.utils.clip_grad_norm_(policy.parameters(), CONFIG["max_grad_norm"])
-                        optimizer.step()
-                    
-                    # Clear buffer
-                    buffer.clear()
-                
-                # Save checkpoint periodically
-                if global_step % CONFIG["checkpoint_interval"] == 0:
-                    checkpoint_path = f"{CONFIG['checkpoint_dir']}/{CONFIG['model_name']}_step_{global_step}.pt"
-                    torch.save({
-                        'model_state_dict': policy.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'global_step': global_step
-                    }, checkpoint_path)
-                    print(f"Saved checkpoint at step {global_step} to {checkpoint_path}")
-                
-                # Evaluate model periodically
-                if global_step % CONFIG["eval_interval"] == 0:
-                    eval_reward = evaluate(policy, env, device, episodes=5)
-                    print(f"Step {global_step}: Evaluation reward: {eval_reward:.2f}")
-            
-            # Track episode rewards
-            episode_rewards.append(episode_reward)
-            print(f"Episode finished. Reward: {episode_reward:.2f}, Total steps: {global_step}")
-    except KeyboardInterrupt:
-        print("Training interrupted. Saving current model...")
-    finally:
-        # Save final model
-        final_checkpoint_path = f"{CONFIG['checkpoint_dir']}/{CONFIG['model_name']}_final.pt"
-        torch.save({
-            'model_state_dict': policy.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'global_step': global_step
-        }, final_checkpoint_path)
-        print(f"Training complete. Final model saved to {final_checkpoint_path}")
-
-def evaluate(policy, env, device, episodes=10):
-    """Evaluate the policy without exploration"""
-    policy.eval()
-    total_rewards = []
+                # Track losses
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy += entropy.item()
+        
+        # Average losses over epochs and batches
+        num_updates = self.ppo_epochs * ((len(observations) + batch_size - 1) // batch_size)
+        avg_policy_loss = total_policy_loss / num_updates
+        avg_value_loss = total_value_loss / num_updates
+        avg_entropy = total_entropy / num_updates
+        
+        return {
+            'policy_loss': avg_policy_loss,
+            'value_loss': avg_value_loss,
+            'entropy': avg_entropy
+        }
     
-    for _ in range(episodes):
-        obs = env.reset()
+    def save_checkpoint(self, path, is_best=False):
+        """Save model checkpoint."""
+        checkpoint = {
+            'model_type': self.model_type,
+            'feature_extractor': self.feature_extractor.state_dict(),
+            'policy': self.policy.state_dict(),
+            'value': self.value.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'best_reward': self.best_reward
+        }
+        
+        torch.save(checkpoint, path)
+        
+        if is_best:
+            best_path = os.path.join(os.path.dirname(path), 'best_model.pth')
+            torch.save(checkpoint, best_path)
+            logger.info(f"Saved new best model with reward {self.best_reward}")
+    
+    def load_checkpoint(self, path):
+        """Load model checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        # Check model type
+        if checkpoint['model_type'] != self.model_type:
+            logger.warning(f"Loading checkpoint with different model type: {checkpoint['model_type']} vs {self.model_type}")
+            
+            # Reinitialize feature extractor with correct model type
+            self.feature_extractor = FeatureExtractor(model_type=checkpoint['model_type']).to(self.device)
+            self.model_type = checkpoint['model_type']
+        
+        # Load network states
+        self.feature_extractor.load_state_dict(checkpoint['feature_extractor'])
+        self.policy.load_state_dict(checkpoint['policy'])
+        self.value.load_state_dict(checkpoint['value'])
+        
+        # Load optimizer state
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        
+        # Load best reward
+        self.best_reward = checkpoint['best_reward']
+        
+        logger.info(f"Loaded checkpoint with best reward {self.best_reward}")
+        
+        return checkpoint
+
+def train(agent, env, num_episodes=1000, checkpoint_dir="checkpoints", log_interval=10, checkpoint_interval=50, num_workers=4):
+    """Train the agent using PPO."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_dir = os.path.join(checkpoint_dir, agent.model_type)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Create metrics tracking
+    all_rewards = []
+    episode_rewards = []
+    success_rate = []
+    
+    # For visualization
+    plt.figure(figsize=(12, 8))
+    
+    # Training loop
+    for episode in range(1, num_episodes + 1):
+        # Initialize episode data
+        observations = []
+        actions = []
+        log_probs = []
+        rewards = []
+        dones = []
+        values = []
+        
+        # Reset environment
+        observation, _ = env.reset()
+        
         done = False
         episode_reward = 0
         
+        # Episode loop
         while not done:
-            # Convert observations to tensors
-            camera_img = torch.FloatTensor(np.expand_dims(obs['camera'], 0)).to(device)
-            lidar_data = torch.FloatTensor(np.expand_dims(obs['lidar'], 0)).to(device)
+            # Get action
+            action, log_prob, value = agent.get_action(observation)
             
-            # Get best action (no exploration)
-            with torch.no_grad():
-                action_logits, _ = policy(camera_img, lidar_data)
-                action = torch.argmax(action_logits, dim=1).item()
+            # Take action in environment
+            next_observation, reward, done, _, info = env.step(action)
             
-            obs, reward, done, _ = env.step(action)
+            # Store data
+            observations.append(observation)
+            actions.append(action)
+            log_probs.append(log_prob)
+            rewards.append(reward)
+            dones.append(done)
+            values.append(value)
+            
+            # Update for next step
+            observation = next_observation
             episode_reward += reward
         
-        total_rewards.append(episode_reward)
+        # Track episode metrics
+        episode_rewards.append(episode_reward)
+        all_rewards.append(episode_reward)
+        success_rate.append(1 if info.get("landing_success", False) else 0)
+        
+        # Prepare rollout data
+        rollouts = {
+            'observations': observations,
+            'actions': actions,
+            'log_probs': log_probs,
+            'rewards': rewards,
+            'dones': dones,
+            'values': values
+        }
+        
+        # Update agent
+        loss_info = agent.update(rollouts)
+        
+        # Logging
+        if episode % log_interval == 0:
+            avg_reward = np.mean(episode_rewards[-log_interval:])
+            avg_success = np.mean(success_rate[-log_interval:]) * 100
+            
+            logger.info(f"Episode {episode}/{num_episodes} | " +
+                        f"Avg Reward: {avg_reward:.2f} | " +
+                        f"Success Rate: {avg_success:.2f}% | " +
+f"Loss: Policy={loss_info['policy_loss']:.4f}, Value={loss_info['value_loss']:.4f}, Entropy={loss_info['entropy']:.4f}")
+        
+        # Update visualization
+        if episode % log_interval == 0:
+            plt.clf()
+            
+            # Plot rewards
+            plt.subplot(2, 2, 1)
+            plt.plot(np.arange(1, len(all_rewards) + 1), all_rewards)
+            plt.title('Episode Rewards')
+            plt.xlabel('Episode')
+            plt.ylabel('Reward')
+            
+            # Plot success rate (moving average)
+            plt.subplot(2, 2, 2)
+            window_size = min(100, len(success_rate))
+            moving_avg = [np.mean(success_rate[max(0, i - window_size):i + 1]) * 100 
+                         for i in range(len(success_rate))]
+            plt.plot(np.arange(1, len(success_rate) + 1), moving_avg)
+            plt.title('Landing Success Rate (%)')
+            plt.xlabel('Episode')
+            plt.ylabel('Success Rate')
+            plt.ylim(0, 100)
+            
+            # Plot the latest trajectory
+            plt.subplot(2, 2, 3)
+            traj_x, traj_y = zip(*env.trajectory)
+            plt.plot(np.arange(len(env.terrain)), env.terrain, 'g-', label='Terrain')
+            plt.plot(traj_x, traj_y, 'b-', label='Drone Path')
+            plt.scatter(traj_x[-1], traj_y[-1], color='r', s=50, label='Landing Point')
+            plt.title('Latest Drone Trajectory')
+            plt.xlabel('Position')
+            plt.ylabel('Height')
+            plt.legend()
+            
+            # Plot policy loss
+            plt.subplot(2, 2, 4)
+            plt.title('Training Metrics')
+            plt.xlabel('Episode (Sampled)')
+            plt.ylabel('Value')
+            
+            # Save plot
+            plt.tight_layout()
+            plt.savefig(os.path.join(checkpoint_dir, 'training_progress.png'))
+            plt.draw()
+            plt.pause(0.001)
+            
+        # Save checkpoint
+        if episode % checkpoint_interval == 0:
+            checkpoint_path = os.path.join(checkpoint_dir, f'model_episode_{episode}.pth')
+            agent.save_checkpoint(checkpoint_path)
+        
+        # Check if this is the best model so far
+        if np.mean(episode_rewards[-10:]) > agent.best_reward:
+            agent.best_reward = np.mean(episode_rewards[-10:])
+            best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
+            agent.save_checkpoint(best_model_path, is_best=True)
     
-    policy.train()
-    return np.mean(total_rewards)
+    # Save final model
+    final_model_path = os.path.join(checkpoint_dir, 'final_model.pth')
+    agent.save_checkpoint(final_model_path)
+    
+    plt.close()
+    
+    return agent
 
-def test(checkpoint_path):
-    """Test the trained model"""
-    # Create environment and policy
-    env = AirSimDroneLandingEnv()
+def parallel_evaluate(args):
+    """Function for parallel evaluation of the model."""
+    agent, model_path, episode = args
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Load model
+    agent.load_checkpoint(model_path)
     
-    policy = ViTDronePolicy(
-        image_size=CONFIG["image_size"],
-        patch_size=CONFIG["patch_size"],
-        lidar_points=CONFIG["lidar_points"],
-        hidden_dim=CONFIG["hidden_dim"],
-        action_dim=env.action_space.n
-    ).to(device)
+    # Create environment
+    env = DroneEnvironment(starting_height=10)
     
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    policy.load_state_dict(checkpoint['model_state_dict'])
-    policy.eval()
+    # Run evaluation episode
+    observation, _ = env.reset()
+    done = False
+    total_reward = 0
+    trajectory = []
     
-    print(f"Loaded model from {checkpoint_path}")
-    print(f"Testing for 10 episodes...")
-    
-    # Test for multiple episodes
-    successful_landings = 0
-    total_episodes = 10
-    
-    for episode in range(total_episodes):
-        obs = env.reset()
-        done = False
-        episode_reward = 0
-        step = 0
+    while not done:
+        action, _, _ = agent.get_action(observation, evaluate=True)
+        next_observation, reward, done, _, info = env.step(action)
         
-        print(f"Episode {episode+1}/{total_episodes}")
-        
-        while not done:
-            # Convert observations to tensors
-            camera_img = torch.FloatTensor(np.expand_dims(obs['camera'], 0)).to(device)
-            lidar_data = torch.FloatTensor(np.expand_dims(obs['lidar'], 0)).to(device)
-            
-            # Get best action (no exploration)
-            with torch.no_grad():
-                action_logits, _ = policy(camera_img, lidar_data)
-                action = torch.argmax(action_logits, dim=1).item()
-            
-            # Step environment
-            obs, reward, done, info = env.step(action)
-            episode_reward += reward
-            step += 1
-            
-            # Print status every 10 steps
-            if step % 10 == 0:
-                print(f"  Step {step}: Height: {info['height']:.2f}m, Reward: {reward:.2f}")
-        
-        # Check if landing was successful
-        if info.get('landed', False):
-            print(f"Episode {episode+1} - SUCCESS: Landed safely! Total reward: {episode_reward:.2f}")
-            successful_landings += 1
-        else:
-            print(f"Episode {episode+1} - FAILURE: Mission failed. Total reward: {episode_reward:.2f}")
+        observation = next_observation
+        total_reward += reward
+        trajectory.append((env.drone_x, env.drone_y))
     
-    success_rate = successful_landings / total_episodes * 100
-    print(f"\nTest completed. Success rate: {success_rate:.2f}% ({successful_landings}/{total_episodes})")
+    # Return results
+    return {
+        'episode': episode,
+        'reward': total_reward,
+        'success': info.get('landing_success', False),
+        'trajectory': trajectory,
+        'terrain': env.terrain
+    }
+
+def evaluate(agent, model_path, num_episodes=100, num_workers=4):
+    """Evaluate a trained model."""
+    logger.info(f"Evaluating model: {model_path}")
+    
+    # Setup parallel workers
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        args = [(agent, model_path, i) for i in range(num_episodes)]
+        results = list(executor.map(parallel_evaluate, args))
+    
+    # Compile results
+    rewards = [r['reward'] for r in results]
+    success_count = sum(1 for r in results if r['success'])
+    
+    # Log results
+    avg_reward = np.mean(rewards)
+    success_rate = success_count / num_episodes * 100
+    
+    logger.info(f"Evaluation Results:")
+    logger.info(f"Average Reward: {avg_reward:.2f}")
+    logger.info(f"Success Rate: {success_rate:.2f}%")
+    
+    # Plot results
+    plt.figure(figsize=(15, 10))
+    
+    # Plot reward distribution
+    plt.subplot(2, 2, 1)
+    plt.hist(rewards, bins=20)
+    plt.title('Reward Distribution')
+    plt.xlabel('Reward')
+    plt.ylabel('Count')
+    
+    # Plot success rate
+    plt.subplot(2, 2, 2)
+    labels = ['Success', 'Failure']
+    sizes = [success_count, num_episodes - success_count]
+    plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
+    plt.axis('equal')
+    plt.title('Landing Success Rate')
+    
+    # Plot sample trajectories (successful and failed)
+    plt.subplot(2, 2, 3)
+    
+    # Find successful and failed examples
+    successful = [r for r in results if r['success']]
+    failed = [r for r in results if not r['success']]
+    
+    # Plot successful trajectory if available
+    if successful:
+        sample = random.choice(successful)
+        traj_x, traj_y = zip(*sample['trajectory'])
+        plt.plot(np.arange(len(sample['terrain'])), sample['terrain'], 'g-', label='Terrain')
+        plt.plot(traj_x, traj_y, 'b-', label='Drone Path')
+        plt.scatter(traj_x[-1], traj_y[-1], color='r', s=50, label='Landing Point')
+        plt.title('Successful Landing Example')
+        plt.xlabel('Position')
+        plt.ylabel('Height')
+        plt.legend()
+    
+    # Plot failed trajectory if available
+    plt.subplot(2, 2, 4)
+    if failed:
+        sample = random.choice(failed)
+        traj_x, traj_y = zip(*sample['trajectory'])
+        plt.plot(np.arange(len(sample['terrain'])), sample['terrain'], 'g-', label='Terrain')
+        plt.plot(traj_x, traj_y, 'b-', label='Drone Path')
+        plt.scatter(traj_x[-1], traj_y[-1], color='r', s=50, label='Landing Point')
+        plt.title('Failed Landing Example')
+        plt.xlabel('Position')
+        plt.ylabel('Height')
+        plt.legend()
+    
+    # Save plot
+    plt.tight_layout()
+    evaluation_dir = os.path.dirname(model_path)
+    plt.savefig(os.path.join(evaluation_dir, 'evaluation_results.png'))
+    plt.show()
+    
+    return {
+        'avg_reward': avg_reward,
+        'success_rate': success_rate,
+        'results': results
+    }
+
+def compare_models(model_paths, num_episodes=50, num_workers=4):
+    """Compare different models (e.g., VIT vs ResNet50 vs CNN)."""
+    logger.info("Comparing models:")
+    for path in model_paths:
+        logger.info(f"  - {path}")
+    
+    results = {}
+    
+    for path in model_paths:
+        # Extract model type from path
+        model_type = os.path.basename(os.path.dirname(path))
+        
+        # Create agent with correct model type
+        agent = PPOAgent(model_type=model_type)
+        
+        # Evaluate model
+        eval_results = evaluate(agent, path, num_episodes=num_episodes, num_workers=num_workers)
+        
+        # Store results
+        results[model_type] = eval_results
+    
+    # Compare results
+    plt.figure(figsize=(12, 6))
+    
+    # Plot average rewards
+    plt.subplot(1, 2, 1)
+    model_types = list(results.keys())
+    avg_rewards = [results[model]['avg_reward'] for model in model_types]
+    plt.bar(model_types, avg_rewards)
+    plt.title('Average Reward by Model Type')
+    plt.xlabel('Model Type')
+    plt.ylabel('Average Reward')
+    
+    # Plot success rates
+    plt.subplot(1, 2, 2)
+    success_rates = [results[model]['success_rate'] for model in model_types]
+    plt.bar(model_types, success_rates)
+    plt.title('Success Rate by Model Type')
+    plt.xlabel('Model Type')
+    plt.ylabel('Success Rate (%)')
+    plt.ylim(0, 100)
+    
+    # Save comparison
+    plt.tight_layout()
+    plt.savefig('model_comparison.png')
+    plt.show()
+    
+    # Log comparison
+    logger.info("\nModel Comparison Results:")
+    for model in model_types:
+        logger.info(f"{model}:")
+        logger.info(f"  Average Reward: {results[model]['avg_reward']:.2f}")
+        logger.info(f"  Success Rate: {results[model]['success_rate']:.2f}%")
+    
+    return results
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Drone Landing with RL")
-    parser.add_argument("--mode", type=str, default="train", choices=["train", "test"],
-                       help="Whether to train or test the model")
-    parser.add_argument("--checkpoint", type=str, default=None,
-                       help="Checkpoint path for testing")
+    parser = argparse.ArgumentParser(description="Drone Landing RL with PPO")
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'evaluate', 'compare'],
+                       help='Mode to run the script in')
+    parser.add_argument('--model_type', type=str, default='vit', choices=['vit', 'resnet50', 'cnn'],
+                       help='Type of vision model to use')
+    parser.add_argument('--model_path', type=str, default=None,
+                       help='Path to model checkpoint for evaluation')
+    parser.add_argument('--num_episodes', type=int, default=1000,
+                       help='Number of episodes for training or evaluation')
+    parser.add_argument('--checkpoint_interval', type=int, default=50,
+                       help='Interval for saving checkpoints during training')
+    parser.add_argument('--log_interval', type=int, default=10,
+                       help='Interval for logging during training')
+    parser.add_argument('--starting_height', type=int, default=10,
+                       help='Starting height of the drone')
+    parser.add_argument('--num_workers', type=int, default=4,
+                       help='Number of worker cores to use for parallelization')
     
     args = parser.parse_args()
     
-    if args.mode == "train":
-        train()
-    elif args.mode == "test":
-        if args.checkpoint is None:
-            print("Please provide a checkpoint path for testing with --checkpoint")
+    # Setup
+    checkpoint_dir = os.path.join("checkpoints", args.model_type)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Run in specified mode
+    if args.mode == 'train':
+        logger.info(f"Training drone landing with model type: {args.model_type}")
+        
+        # Create environment and agent
+        env = DroneEnvironment(starting_height=args.starting_height)
+        agent = PPOAgent(model_type=args.model_type)
+        
+        # Train agent
+        trained_agent = train(
+            agent, 
+            env, 
+            num_episodes=args.num_episodes,
+            checkpoint_dir="checkpoints",
+            log_interval=args.log_interval,
+            checkpoint_interval=args.checkpoint_interval,
+            num_workers=args.num_workers
+        )
+        
+        logger.info("Training completed!")
+        
+    elif args.mode == 'evaluate':
+        if args.model_path is None:
+            args.model_path = os.path.join(checkpoint_dir, "best_model.pth")
+            
+        logger.info(f"Evaluating model: {args.model_path}")
+        
+        # Create agent
+        agent = PPOAgent(model_type=args.model_type)
+        
+        # Evaluate agent
+        evaluation_results = evaluate(
+            agent, 
+            args.model_path, 
+            num_episodes=args.num_episodes,
+            num_workers=args.num_workers
+        )
+        
+        logger.info("Evaluation completed!")
+        
+    elif args.mode == 'compare':
+        logger.info("Comparing different model architectures")
+        
+        # Find best model for each type
+        model_paths = []
+        for model_type in ['vit', 'resnet50', 'cnn']:
+            model_path = os.path.join("checkpoints", model_type, "best_model.pth")
+            if os.path.exists(model_path):
+                model_paths.append(model_path)
+            else:
+                logger.warning(f"No model found for {model_type}")
+        
+        if not model_paths:
+            logger.error("No models found for comparison. Train models first.")
         else:
-            test(args.checkpoint)
+            # Compare models
+            comparison_results = compare_models(
+                model_paths, 
+                num_episodes=args.num_episodes,
+                num_workers=args.num_workers
+            )
+            
+            logger.info("Comparison completed!")
