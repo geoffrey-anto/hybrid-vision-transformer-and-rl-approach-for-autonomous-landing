@@ -17,3 +17,5 @@ dataset/*
 
 checkpoints
 checkpoints*
+
+*.log

@@ -1,3 +1,0 @@
-Model: vit
-Episodes: 1000
-Update interval: 2048
