@@ -162,7 +162,7 @@ class AirSimDroneLandingEnv:
         """Set up the LiDAR sensor in AirSim"""
         try:
             # Check if the LiDAR sensor is already set up
-            self.client.getLidarData(lidar_name=CONFIG["lidar_sensor_name"])
+            self.client.getLidarData(lidar_name="LidarSensor2", vehicle_name="")
             print(f"LiDAR sensor '{CONFIG['lidar_sensor_name']}' already exists.")
         except:
             print(f"Setting up LiDAR sensor '{CONFIG['lidar_sensor_name']}'...")
@@ -198,9 +198,10 @@ class AirSimDroneLandingEnv:
         self.client.takeoffAsync().join()
         
         # Random starting position within a reasonable area
-        x = np.random.uniform(-10, 10)
-        y = np.random.uniform(-10, 10)
-        z = -20  # 20m above ground (negative z is up in AirSim)
+        x = np.random.uniform(-40, 40)
+        y = np.random.uniform(-40, 40)
+        print(x, y)
+        z = -30  # 20m above ground (negative z is up in AirSim)
         
         # Move to starting position
         self.client.moveToPositionAsync(x, y, z, 5).join()
@@ -220,14 +221,14 @@ class AirSimDroneLandingEnv:
         self.episode_steps += 1
         
         # Convert action to drone movement
-        if action == 0:  # Forward
-            self.client.moveByVelocityAsync(1, 0, 0, 0.5).join()
-        elif action == 1:  # Backward
-            self.client.moveByVelocityAsync(-1, 0, 0, 0.5).join()
-        elif action == 2:  # Left
+        if action == 0:  # Left
             self.client.moveByVelocityAsync(0, -1, 0, 0.5).join()
-        elif action == 3:  # Right
+        elif action == 1:  # Right
             self.client.moveByVelocityAsync(0, 1, 0, 0.5).join()
+        elif action == 2:  # Down
+            self.client.moveByVelocityAsync(0, 0, 1, 0.5).join()
+        elif action == 3:  # Forward
+            self.client.moveByVelocityAsync(1, 0, 0, 0.5).join()
         
         # Wait a bit for the action to take effect
         time.sleep(0.1)
@@ -235,6 +236,9 @@ class AirSimDroneLandingEnv:
         # Get drone state
         drone_state = self.client.getMultirotorState()
         position = drone_state.kinematics_estimated.position
+
+        if self.episode_steps % 10 == 0:
+            print(f"Step {self.episode_steps}: Position: ({position.x_val}, {position.y_val}, {position.z_val})")
         
         # Calculate distance to ground
         ground_z = 0  # Assuming ground is at z=0
@@ -277,7 +281,7 @@ class AirSimDroneLandingEnv:
         velocity_z = drone_state.kinematics_estimated.linear_velocity.z_val
         
         # Small reward for getting closer to the ground
-        height_reward = -0.1 * height
+        height_reward = -0.2 * height
         
         # Penalty for high velocity when close to ground
         velocity_penalty = 0
@@ -295,7 +299,7 @@ class AirSimDroneLandingEnv:
         """Get observation from AirSim"""
         # Get camera image
         responses = self.client.simGetImages([
-            airsim.ImageRequest("0", airsim.ImageType.Scene, False, False)
+            airsim.ImageRequest("bottom_center", airsim.ImageType.Scene, False, False)
         ])
         
         # Process image
@@ -309,14 +313,14 @@ class AirSimDroneLandingEnv:
         
         # Get LiDAR data with error handling
         try:
-            lidar_data = self.client.getLidarData(lidar_name=CONFIG["lidar_sensor_name"])
+            lidar_data = self.client.getLidarData(lidar_name="LidarSensor2")
             
             if lidar_data and len(lidar_data.point_cloud) >= 3:
                 # Process valid LiDAR data
                 points = np.array(lidar_data.point_cloud, dtype=np.float32).reshape(-1, 3)
             else:
                 # Handle empty LiDAR data
-                print("Warning: Empty LiDAR data received, using simulated data")
+                # print("Warning: Empty LiDAR data received, using simulated data")
                 # Generate fake points around the drone as a fallback
                 drone_pos = self.client.getMultirotorState().kinematics_estimated.position
                 points = self._generate_simulated_lidar_points(drone_pos)

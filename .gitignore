@@ -13,3 +13,7 @@ dataset/*
 !/dataset/generate.py
 
 *.pth
+*.pt
+
+checkpoints
+checkpoints*
