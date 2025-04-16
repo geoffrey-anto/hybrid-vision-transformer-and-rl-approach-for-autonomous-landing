@@ -741,6 +741,10 @@ def train(agent, env, num_episodes=1000, checkpoint_dir="checkpoints", log_inter
     
     # For visualization
     plt.figure(figsize=(12, 8))
+
+    global_average_reward = 0.00
+    global_loss = 0.00
+    global_landing_success = 0.00
     
     # Training loop
     for episode in range(1, num_episodes + 1):
@@ -777,11 +781,17 @@ def train(agent, env, num_episodes=1000, checkpoint_dir="checkpoints", log_inter
             # Update for next step
             observation = next_observation
             episode_reward += reward
+
+        global_average_reward += episode_reward
         
         # Track episode metrics
         episode_rewards.append(episode_reward)
-        all_rewards.append(episode_reward)
+        if episode >= log_interval and episode % log_interval == 0:
+            avg_reward = np.mean(episode_rewards[-log_interval:])
+            all_rewards.append(avg_reward)
         success_rate.append(1 if info.get("landing_success", False) else 0)
+
+        global_landing_success += info.get("landing_success", False)
         
         # Prepare rollout data
         rollouts = {
@@ -795,6 +805,8 @@ def train(agent, env, num_episodes=1000, checkpoint_dir="checkpoints", log_inter
         
         # Update agent
         loss_info = agent.update(rollouts)
+
+        global_loss += loss_info['policy_loss'] + loss_info['value_loss'] + loss_info['entropy']
         
         # Logging
         if episode % log_interval == 0:
@@ -861,6 +873,23 @@ f"Loss: Policy={loss_info['policy_loss']:.4f}, Value={loss_info['value_loss']:.4
             agent.best_reward = np.mean(episode_rewards[-10:])
             best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
             agent.save_checkpoint(best_model_path, is_best=True)
+
+    # Final evaluation
+    print("Training complete. Evaluating final model...")
+    logger.info("Training complete. Evaluating final model...")
+
+    print(f"Global Average Reward: {global_average_reward / num_episodes:.2f}")
+    logger.info(f"Global Average Reward: {global_average_reward / num_episodes:.2f}")
+
+    print(f"Global Loss: {global_loss / num_episodes:.4f}")
+    logger.info(f"Global Loss: {global_loss / num_episodes:.4f}")
+
+    print(f"Best Reward: {agent.best_reward:.2f}")
+    logger.info(f"Best Reward: {agent.best_reward:.2f}")
+
+    print(f"Global Landing Success Rate: {global_landing_success / num_episodes * 100:.2f}%")
+    logger.info(f"Global Landing Success Rate: {global_landing_success / num_episodes * 100:.2f}%")
+
     
     # Save final model
     final_model_path = os.path.join(checkpoint_dir, 'final_model.pth')
