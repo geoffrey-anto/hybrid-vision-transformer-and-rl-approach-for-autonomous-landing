@@ -18,7 +18,7 @@ import logging
 import random
 
 # Add this near the top of the script, after the imports
-def set_seeds(seed=100):
+def set_seeds(seed=160):
     """Set random seeds for reproducibility."""
     
     random.seed(seed)
@@ -269,9 +269,9 @@ def test_agent(agent, args):
                 collision_info = client.simGetCollisionInfo(vehicle_name)
                 done = collision_info.has_collided
                 
-                if done:
+                if done and step != 0:
                     reward = -100.0  # Penalty for collision
-                    logger.info(f"Episode {episode+1} terminated due to collision at step {step}")
+                    logger.info(f"Episode {episode+1} finished at step {step}")
                     break
                 
                 episode_reward += reward
